@@ -1,0 +1,20 @@
+# Competition data and anything derived from it must never be committed (competition rule 4.b)
+data/
+runs*/
+*.csv
+*.npz
+*.npy
+*.dcm
+*.png
+*.json
+*.log
+# Model weights
+*.pt
+*.pth
+*.safetensors
+# Python environments / caches
+.venv*/
+__pycache__/
+.ipynb_checkpoints/
+# Scratch
+rsna_knee.ipynb
