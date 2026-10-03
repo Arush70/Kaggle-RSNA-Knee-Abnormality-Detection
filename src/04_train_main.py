@@ -23,17 +23,21 @@ from sklearn.metrics import roc_auc_score
 
 CFG = dict(
     fold=0,
-    backbone="efficientnet_b0.ra_in1k",
+    backbone="vit_small_patch14_dinov2.lvd142m",   # DINOv2-small, the backbone behind the top public notebooks
+    freeze_blocks=6,       # ViT only: first k transformer blocks frozen (public recipe: 6 of 12)
+    img_size=252,          # ViT only: centre-crop 256 -> 252 (multiple of the 14-px patch)
     pretrained=1,          # 0 only for offline smoke tests
-    epochs=20,
+    epochs=15,
     batch_size=4,          # studies per step (each study = up to 5 slots x 20 slices)
     accum=2,               # gradient accumulation steps -> effective batch 8
-    lr_backbone=3e-4, lr_head=1e-3, weight_decay=1e-2, warmup_frac=0.05,
-    n_slices_use=20,       # of the 20 stored slices per slot
+    lr_backbone=5e-5, lr_head=1e-3, weight_decay=1e-2, warmup_frac=0.05,   # DINOv2 fine-tuning needs a much smaller backbone LR
+    n_slices_use=16,       # of the 20 stored slices per slot
     flip_p=0.5,            # probability of mirroring a whole study left<->right during training
     tta=1,                 # average original + mirrored prediction at validation
     gold_weight=3.0,       # loss weight for the radiologist-labelled studies
     calib_k=4.0,           # smoothing strength for grade -> probability calibration
+    pub_labels="",         # optional path/filename of public LLM labels (report_labels_v2.csv); "" = ours only
+    label_mix=0.5,         # weight of public labels in the training target (0 = ours only, 1 = public only)
     workers=4,
     seed=42,
     max_train_studies=None,  # set e.g. 200 for a quick smoke test
@@ -73,7 +77,7 @@ def find(roots, name, must_col=None):
 # ## Data: targets + dataset
 
 # %%
-def build_targets(train, grades, folds, fold, k):
+def build_targets(train, grades, folds, fold, k, pub=None, mix=0.0):
     """Soft target per study/label = P(radiologist positive | report grade), fit on training-fold gold studies only."""
     df = train[["StudyInstanceUID"] + LABELS].merge(grades[["StudyInstanceUID"] + LABEL_KEYS], on="StudyInstanceUID") \
                                              .merge(folds[["StudyInstanceUID", "fold"]], on="StudyInstanceUID")
@@ -87,6 +91,11 @@ def build_targets(train, grades, folds, fold, k):
         p = np.array([(fit.loc[fit[key] == g, lab].sum() + k * prior[g]) / ((fit[key] == g).sum() + k) for g in range(5)])
         calib[lab] = np.maximum.accumulate(p).round(4).tolist()   # non-decreasing in grade
     T = np.stack([np.array(calib[lab])[df[key].astype(int).values] for lab, key in zip(LABELS, LABEL_KEYS)], 1)
+    if pub is not None and mix > 0:
+        P = df[["StudyInstanceUID"]].merge(pub[["StudyInstanceUID"] + LABELS], on="StudyInstanceUID", how="left")[LABELS].values
+        have = ~np.isnan(P).any(1)
+        T[have] = (1 - mix) * T[have] + mix * P[have]
+        print(f"public labels mixed in at weight {mix} for {int(have.sum())}/{len(T)} studies")
     T[gold.values] = df.loc[gold, LABELS].values                 # true labels where we have them
     W = np.where(gold.values, 1.0, 0.0)
     proxy = (df[LABEL_KEYS].values >= 3).astype(np.float32)       # report-derived proxy positives (for validation)
@@ -158,7 +167,12 @@ def main(cfg):
     mcols = [c for c in vidx.columns if c.startswith("m_")]
     mask_of = {u: m for u, m in zip(vidx.StudyInstanceUID, vidx[mcols].values)}
 
-    meta, T, W, proxy, calib = build_targets(train, grades, folds, fold, cfg["calib_k"])
+    pub = None
+    if cfg["pub_labels"]:
+        pp = cfg["pub_labels"] if os.path.isfile(cfg["pub_labels"]) else find(roots + ["pub"], os.path.basename(cfg["pub_labels"]))
+        pub = pd.read_csv(pp)
+        print("public labels:", pp, pub.shape)
+    meta, T, W, proxy, calib = build_targets(train, grades, folds, fold, cfg["calib_k"], pub, cfg["label_mix"])
     keep = meta.StudyInstanceUID.isin(shard_of).values
     meta, T, W, proxy = meta[keep].reset_index(drop=True), T[keep], W[keep], proxy[keep]
     W = 1.0 + (cfg["gold_weight"] - 1.0) * W
@@ -173,18 +187,21 @@ def main(cfg):
     amp_dtype = torch.bfloat16 if (dev.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     use_scaler = dev.type == "cuda" and amp_dtype == torch.float16
     print("device:", torch.cuda.get_device_name(0) if dev.type == "cuda" else "cpu", "| amp:", amp_dtype)
+    print(f"BACKBONE: {cfg['backbone']} | frozen blocks: {cfg['freeze_blocks']} | img {cfg['img_size']} | "
+          f"slices/slot {cfg['n_slices_use']} | epochs {cfg['epochs']} | lr_backbone {cfg['lr_backbone']}")
 
     mk = lambda ix, tgt: VolDS(meta.StudyInstanceUID.values[ix], shard_of, mask_of, T[ix] if tgt else None, W[ix] if tgt else None)
     kw = dict(num_workers=cfg["workers"], pin_memory=dev.type == "cuda", persistent_workers=cfg["workers"] > 0)
     dl_tr = torch.utils.data.DataLoader(mk(tr, True), batch_size=cfg["batch_size"], shuffle=True, drop_last=True, **kw)
     dl_va = torch.utils.data.DataLoader(mk(va, False), batch_size=cfg["batch_size"], shuffle=False, **kw)
 
-    model = KneeNet(cfg["backbone"], pretrained=bool(cfg["pretrained"])).to(dev)
+    model = KneeNet(cfg["backbone"], pretrained=bool(cfg["pretrained"]), freeze_blocks=cfg["freeze_blocks"],
+                    img_size=cfg["img_size"] if "dinov2" in cfg["backbone"] or "vit" in cfg["backbone"] else None).to(dev)
     sidx = slice_indices(20, cfg["n_slices_use"])
-    enc_params = list(model.enc.parameters())
+    enc_params = [p for p in model.enc.parameters() if p.requires_grad]
     enc_ids = {id(p) for p in enc_params}
     opt = torch.optim.AdamW([{"params": enc_params, "lr": cfg["lr_backbone"]},
-                             {"params": [p for p in model.parameters() if id(p) not in enc_ids], "lr": cfg["lr_head"]}],
+                             {"params": [p for p in model.parameters() if id(p) not in enc_ids and p.requires_grad and not any(p is q for q in model.enc.parameters())], "lr": cfg["lr_head"]}],
                             weight_decay=cfg["weight_decay"])
     steps = cfg["epochs"] * len(dl_tr) // cfg["accum"]
     warm = max(1, int(steps * cfg["warmup_frac"]))

@@ -41,12 +41,14 @@ IMG_ROOT = os.path.join(DATA, "test_series")
 print(f"test studies: {len(test_ids)}")
 
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ckpts = sorted(glob.glob(f"{INPUT_ROOT}/**/model_f*.pt", recursive=True))
+ckpts = sorted(glob.glob(os.environ.get("KNEE_MODEL_GLOB", f"{INPUT_ROOT}/**/model_f*.pt"), recursive=True))
 assert ckpts, "No model_f*.pt found — attach notebook 04's output (or your model dataset) as an input."
 models, sidx_list = [], []
 for c in ckpts:
     ck = torch.load(c, map_location="cpu", weights_only=False)
-    m = KneeNet(ck["cfg"]["backbone"], pretrained=False, grad_ckpt=False)
+    cf = ck["cfg"]
+    m = KneeNet(cf["backbone"], pretrained=False, grad_ckpt=False, freeze_blocks=cf.get("freeze_blocks", 0),
+                img_size=cf.get("img_size") if ("vit" in cf["backbone"] or "dinov2" in cf["backbone"]) else None)
     m.load_state_dict(ck["state_dict"]); m.to(dev).eval()
     models.append(m); sidx_list.append(slice_indices(N_SLICES, ck["cfg"]["n_slices_use"]))
     print("loaded", os.path.relpath(c, INPUT_ROOT), "| backbone", ck["cfg"]["backbone"], "| epoch", ck.get("epoch"))
@@ -84,7 +86,8 @@ ok = [v for v in preds.values() if v is not None]
 fallback = np.mean(ok, 0) if ok else np.full(len(LABELS), 0.3)
 rows = [{"StudyInstanceUID": u, **dict(zip(LABELS, preds.get(u) if preds.get(u) is not None else fallback))} for u in test_ids]
 sub = pd.DataFrame(rows)[sample.columns]
-sub.to_csv(os.path.join(OUT, "submission.csv"), index=False)
+os.makedirs(OUT, exist_ok=True)
+sub.to_csv(os.path.join(OUT, os.environ.get("KNEE_OUT_NAME", "submission.csv")), index=False)
 print(sub.shape, "| studies with no usable images:", sum(v is None for v in preds.values()),
       f"| total {(time.time()-t0)/60:.1f} min")
 print(sub.head())

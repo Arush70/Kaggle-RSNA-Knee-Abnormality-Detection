@@ -1,6 +1,9 @@
 # Competition data and anything derived from it must never be committed (competition rule 4.b)
 data/
 runs*/
+logs/
+pub/
+_to_delete/
 *.csv
 *.npz
 *.npy
@@ -8,10 +11,11 @@ runs*/
 *.png
 *.json
 *.log
-# Model weights
+# Model weights and third-party binaries
 *.pt
 *.pth
 *.safetensors
+*.whl
 # Python environments / caches
 .venv*/
 __pycache__/

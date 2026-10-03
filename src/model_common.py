@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+import torch.utils.checkpoint
 
 LABELS = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA", "PF OA",
           "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"]
@@ -19,12 +20,27 @@ def to_25d(x, slice_idx):
 
 class KneeNet(nn.Module):
     def __init__(self, backbone="efficientnet_b0.ra_in1k", pretrained=True, n_slots=5, n_slices=20,
-                 d=256, n_layers=2, n_labels=12, drop=0.2, grad_ckpt=True):
+                 d=256, n_layers=2, n_labels=12, drop=0.2, grad_ckpt=True, freeze_blocks=0, img_size=None):
         super().__init__()
-        self.enc = timm.create_model(backbone, pretrained=pretrained, num_classes=0, in_chans=3)
-        if grad_ckpt and hasattr(self.enc, "set_grad_checkpointing"):
-            self.enc.set_grad_checkpointing(True)
-        nf = self.enc.num_features
+        kw = {"img_size": img_size} if img_size else {}
+        self.enc = timm.create_model(backbone, pretrained=pretrained, num_classes=0, in_chans=3, **kw)
+        self.is_vit = hasattr(self.enc, "blocks") and hasattr(self.enc, "patch_embed")
+        self.img_size = img_size
+        self.freeze_blocks = freeze_blocks if self.is_vit else 0
+        self.grad_ckpt = grad_ckpt
+        if self.is_vit:
+            # DINOv2-style: frozen patch embedding + first k blocks, trainable rest; feature = [CLS, mean(patches)]
+            for prm in list(self.enc.patch_embed.parameters()) + [self.enc.pos_embed] + \
+                       ([self.enc.cls_token] if getattr(self.enc, "cls_token", None) is not None else []):
+                prm.requires_grad_(self.freeze_blocks == 0)
+            for blk in self.enc.blocks[:self.freeze_blocks]:
+                for prm in blk.parameters():
+                    prm.requires_grad_(False)
+            nf = 2 * self.enc.num_features
+        else:
+            if grad_ckpt and hasattr(self.enc, "set_grad_checkpointing"):
+                self.enc.set_grad_checkpointing(True)
+            nf = self.enc.num_features
         self.proj = nn.Sequential(nn.Linear(nf, d), nn.LayerNorm(d))
         self.slot_emb = nn.Parameter(torch.zeros(n_slots, 1, d))
         self.pos_emb = nn.Parameter(torch.zeros(1, n_slices, d))
@@ -37,12 +53,34 @@ class KneeNet(nn.Module):
         self.head_w = nn.Parameter(torch.zeros(n_labels, d))
         self.head_b = nn.Parameter(torch.zeros(n_labels))
 
+    def encode(self, imgs):
+        if not self.is_vit:
+            return self.enc(imgs)
+        enc, k = self.enc, self.freeze_blocks
+        if self.img_size and imgs.shape[-1] != self.img_size:   # centre-crop (e.g. 256 -> 252, a multiple of 14)
+            o = (imgs.shape[-1] - self.img_size) // 2
+            imgs = imgs[..., o:o + self.img_size, o:o + self.img_size]
+        with torch.set_grad_enabled(torch.is_grad_enabled() and k == 0):
+            t = enc.patch_embed(imgs)
+            t = enc._pos_embed(t)
+            t = enc.norm_pre(t)
+            for blk in enc.blocks[:k]:
+                t = blk(t)
+        for blk in enc.blocks[k:]:
+            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                t = torch.utils.checkpoint.checkpoint(blk, t, use_reentrant=False)
+            else:
+                t = blk(t)
+        t = enc.norm(t)
+        npt = getattr(enc, "num_prefix_tokens", 1)
+        return torch.cat([t[:, 0], t[:, npt:].mean(1)], 1)
+
     def forward(self, x, mask, slice_idx):
         """x: [B, S, N, H, W] uint8 on device; mask: [B, S] (1 = slot present); slice_idx: slices to use."""
         B, S = x.shape[:2]
         n = len(slice_idx)
         imgs = to_25d(x, slice_idx)                                  # [B, S, n, 3, H, W]
-        feats = self.enc(imgs.flatten(0, 2))                         # [B*S*n, nf]
+        feats = self.encode(imgs.flatten(0, 2))                      # [B*S*n, nf]
         t = self.proj(feats).view(B, S, n, -1)
         pos = self.pos_emb[:, torch.as_tensor(slice_idx, device=x.device)]  # [1, n, d]
         t = t + pos.unsqueeze(0) + self.slot_emb.unsqueeze(0)       # [B, S, n, d]

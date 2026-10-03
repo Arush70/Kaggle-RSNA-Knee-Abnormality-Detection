@@ -1,7 +1,6 @@
-import nbformat, re, sys, os
-HERE = os.path.dirname(os.path.abspath(__file__))
+import nbformat, re, sys
 def build(src_py, out_ipynb):
-    src = open(src_py).read().replace("#@@PREP_COMMON@@", open(os.path.join(HERE, "prep_common.py")).read()).replace("#@@MODEL_COMMON@@", open(os.path.join(HERE, "model_common.py")).read())
+    src = open(src_py).read().replace("#@@PREP_COMMON@@", open("/home/claude/prep_common.py").read()).replace("#@@MODEL_COMMON@@", open("/home/claude/model_common.py").read())
     cells = []
     for chunk in re.split(r"^# %%", src, flags=re.M)[1:]:
         if chunk.startswith(" [markdown]"):

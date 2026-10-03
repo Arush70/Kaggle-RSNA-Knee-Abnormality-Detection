@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+import torch.utils.checkpoint
 
 LABELS = ["ACL", "MCL", "Medial Meniscus", "Lateral Meniscus", "Medial OA", "Lateral OA", "PF OA",
           "Effusion", "Synovitis", "Baker's", "Contusion", "Fracture"]
@@ -35,12 +36,27 @@ def to_25d(x, slice_idx):
 
 class KneeNet(nn.Module):
     def __init__(self, backbone="efficientnet_b0.ra_in1k", pretrained=True, n_slots=5, n_slices=20,
-                 d=256, n_layers=2, n_labels=12, drop=0.2, grad_ckpt=True):
+                 d=256, n_layers=2, n_labels=12, drop=0.2, grad_ckpt=True, freeze_blocks=0, img_size=None):
         super().__init__()
-        self.enc = timm.create_model(backbone, pretrained=pretrained, num_classes=0, in_chans=3)
-        if grad_ckpt and hasattr(self.enc, "set_grad_checkpointing"):
-            self.enc.set_grad_checkpointing(True)
-        nf = self.enc.num_features
+        kw = {"img_size": img_size} if img_size else {}
+        self.enc = timm.create_model(backbone, pretrained=pretrained, num_classes=0, in_chans=3, **kw)
+        self.is_vit = hasattr(self.enc, "blocks") and hasattr(self.enc, "patch_embed")
+        self.img_size = img_size
+        self.freeze_blocks = freeze_blocks if self.is_vit else 0
+        self.grad_ckpt = grad_ckpt
+        if self.is_vit:
+            # DINOv2-style: frozen patch embedding + first k blocks, trainable rest; feature = [CLS, mean(patches)]
+            for prm in list(self.enc.patch_embed.parameters()) + [self.enc.pos_embed] + \
+                       ([self.enc.cls_token] if getattr(self.enc, "cls_token", None) is not None else []):
+                prm.requires_grad_(self.freeze_blocks == 0)
+            for blk in self.enc.blocks[:self.freeze_blocks]:
+                for prm in blk.parameters():
+                    prm.requires_grad_(False)
+            nf = 2 * self.enc.num_features
+        else:
+            if grad_ckpt and hasattr(self.enc, "set_grad_checkpointing"):
+                self.enc.set_grad_checkpointing(True)
+            nf = self.enc.num_features
         self.proj = nn.Sequential(nn.Linear(nf, d), nn.LayerNorm(d))
         self.slot_emb = nn.Parameter(torch.zeros(n_slots, 1, d))
         self.pos_emb = nn.Parameter(torch.zeros(1, n_slices, d))
@@ -53,12 +69,34 @@ class KneeNet(nn.Module):
         self.head_w = nn.Parameter(torch.zeros(n_labels, d))
         self.head_b = nn.Parameter(torch.zeros(n_labels))
 
+    def encode(self, imgs):
+        if not self.is_vit:
+            return self.enc(imgs)
+        enc, k = self.enc, self.freeze_blocks
+        if self.img_size and imgs.shape[-1] != self.img_size:   # centre-crop (e.g. 256 -> 252, a multiple of 14)
+            o = (imgs.shape[-1] - self.img_size) // 2
+            imgs = imgs[..., o:o + self.img_size, o:o + self.img_size]
+        with torch.set_grad_enabled(torch.is_grad_enabled() and k == 0):
+            t = enc.patch_embed(imgs)
+            t = enc._pos_embed(t)
+            t = enc.norm_pre(t)
+            for blk in enc.blocks[:k]:
+                t = blk(t)
+        for blk in enc.blocks[k:]:
+            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+                t = torch.utils.checkpoint.checkpoint(blk, t, use_reentrant=False)
+            else:
+                t = blk(t)
+        t = enc.norm(t)
+        npt = getattr(enc, "num_prefix_tokens", 1)
+        return torch.cat([t[:, 0], t[:, npt:].mean(1)], 1)
+
     def forward(self, x, mask, slice_idx):
         """x: [B, S, N, H, W] uint8 on device; mask: [B, S] (1 = slot present); slice_idx: slices to use."""
         B, S = x.shape[:2]
         n = len(slice_idx)
         imgs = to_25d(x, slice_idx)                                  # [B, S, n, 3, H, W]
-        feats = self.enc(imgs.flatten(0, 2))                         # [B*S*n, nf]
+        feats = self.encode(imgs.flatten(0, 2))                      # [B*S*n, nf]
         t = self.proj(feats).view(B, S, n, -1)
         pos = self.pos_emb[:, torch.as_tensor(slice_idx, device=x.device)]  # [1, n, d]
         t = t + pos.unsqueeze(0) + self.slot_emb.unsqueeze(0)       # [B, S, n, d]
@@ -98,17 +136,21 @@ from sklearn.metrics import roc_auc_score
 
 CFG = dict(
     fold=0,
-    backbone="efficientnet_b0.ra_in1k",
+    backbone="vit_small_patch14_dinov2.lvd142m",   # DINOv2-small, the backbone behind the top public notebooks
+    freeze_blocks=6,       # ViT only: first k transformer blocks frozen (public recipe: 6 of 12)
+    img_size=252,          # ViT only: centre-crop 256 -> 252 (multiple of the 14-px patch)
     pretrained=1,          # 0 only for offline smoke tests
-    epochs=20,
+    epochs=15,
     batch_size=4,          # studies per step (each study = up to 5 slots x 20 slices)
     accum=2,               # gradient accumulation steps -> effective batch 8
-    lr_backbone=3e-4, lr_head=1e-3, weight_decay=1e-2, warmup_frac=0.05,
-    n_slices_use=20,       # of the 20 stored slices per slot
+    lr_backbone=5e-5, lr_head=1e-3, weight_decay=1e-2, warmup_frac=0.05,   # DINOv2 fine-tuning needs a much smaller backbone LR
+    n_slices_use=16,       # of the 20 stored slices per slot
     flip_p=0.5,            # probability of mirroring a whole study left<->right during training
     tta=1,                 # average original + mirrored prediction at validation
     gold_weight=3.0,       # loss weight for the radiologist-labelled studies
     calib_k=4.0,           # smoothing strength for grade -> probability calibration
+    pub_labels="",         # optional path/filename of public LLM labels (report_labels_v2.csv); "" = ours only
+    label_mix=0.5,         # weight of public labels in the training target (0 = ours only, 1 = public only)
     workers=4,
     seed=42,
     max_train_studies=None,  # set e.g. 200 for a quick smoke test
@@ -148,7 +190,7 @@ def find(roots, name, must_col=None):
 # ## Data: targets + dataset
 
 # %%
-def build_targets(train, grades, folds, fold, k):
+def build_targets(train, grades, folds, fold, k, pub=None, mix=0.0):
     """Soft target per study/label = P(radiologist positive | report grade), fit on training-fold gold studies only."""
     df = train[["StudyInstanceUID"] + LABELS].merge(grades[["StudyInstanceUID"] + LABEL_KEYS], on="StudyInstanceUID") \
                                              .merge(folds[["StudyInstanceUID", "fold"]], on="StudyInstanceUID")
@@ -162,6 +204,11 @@ def build_targets(train, grades, folds, fold, k):
         p = np.array([(fit.loc[fit[key] == g, lab].sum() + k * prior[g]) / ((fit[key] == g).sum() + k) for g in range(5)])
         calib[lab] = np.maximum.accumulate(p).round(4).tolist()   # non-decreasing in grade
     T = np.stack([np.array(calib[lab])[df[key].astype(int).values] for lab, key in zip(LABELS, LABEL_KEYS)], 1)
+    if pub is not None and mix > 0:
+        P = df[["StudyInstanceUID"]].merge(pub[["StudyInstanceUID"] + LABELS], on="StudyInstanceUID", how="left")[LABELS].values
+        have = ~np.isnan(P).any(1)
+        T[have] = (1 - mix) * T[have] + mix * P[have]
+        print(f"public labels mixed in at weight {mix} for {int(have.sum())}/{len(T)} studies")
     T[gold.values] = df.loc[gold, LABELS].values                 # true labels where we have them
     W = np.where(gold.values, 1.0, 0.0)
     proxy = (df[LABEL_KEYS].values >= 3).astype(np.float32)       # report-derived proxy positives (for validation)
@@ -233,7 +280,12 @@ def main(cfg):
     mcols = [c for c in vidx.columns if c.startswith("m_")]
     mask_of = {u: m for u, m in zip(vidx.StudyInstanceUID, vidx[mcols].values)}
 
-    meta, T, W, proxy, calib = build_targets(train, grades, folds, fold, cfg["calib_k"])
+    pub = None
+    if cfg["pub_labels"]:
+        pp = cfg["pub_labels"] if os.path.isfile(cfg["pub_labels"]) else find(roots + ["pub"], os.path.basename(cfg["pub_labels"]))
+        pub = pd.read_csv(pp)
+        print("public labels:", pp, pub.shape)
+    meta, T, W, proxy, calib = build_targets(train, grades, folds, fold, cfg["calib_k"], pub, cfg["label_mix"])
     keep = meta.StudyInstanceUID.isin(shard_of).values
     meta, T, W, proxy = meta[keep].reset_index(drop=True), T[keep], W[keep], proxy[keep]
     W = 1.0 + (cfg["gold_weight"] - 1.0) * W
@@ -248,18 +300,21 @@ def main(cfg):
     amp_dtype = torch.bfloat16 if (dev.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     use_scaler = dev.type == "cuda" and amp_dtype == torch.float16
     print("device:", torch.cuda.get_device_name(0) if dev.type == "cuda" else "cpu", "| amp:", amp_dtype)
+    print(f"BACKBONE: {cfg['backbone']} | frozen blocks: {cfg['freeze_blocks']} | img {cfg['img_size']} | "
+          f"slices/slot {cfg['n_slices_use']} | epochs {cfg['epochs']} | lr_backbone {cfg['lr_backbone']}")
 
     mk = lambda ix, tgt: VolDS(meta.StudyInstanceUID.values[ix], shard_of, mask_of, T[ix] if tgt else None, W[ix] if tgt else None)
     kw = dict(num_workers=cfg["workers"], pin_memory=dev.type == "cuda", persistent_workers=cfg["workers"] > 0)
     dl_tr = torch.utils.data.DataLoader(mk(tr, True), batch_size=cfg["batch_size"], shuffle=True, drop_last=True, **kw)
     dl_va = torch.utils.data.DataLoader(mk(va, False), batch_size=cfg["batch_size"], shuffle=False, **kw)
 
-    model = KneeNet(cfg["backbone"], pretrained=bool(cfg["pretrained"])).to(dev)
+    model = KneeNet(cfg["backbone"], pretrained=bool(cfg["pretrained"]), freeze_blocks=cfg["freeze_blocks"],
+                    img_size=cfg["img_size"] if "dinov2" in cfg["backbone"] or "vit" in cfg["backbone"] else None).to(dev)
     sidx = slice_indices(20, cfg["n_slices_use"])
-    enc_params = list(model.enc.parameters())
+    enc_params = [p for p in model.enc.parameters() if p.requires_grad]
     enc_ids = {id(p) for p in enc_params}
     opt = torch.optim.AdamW([{"params": enc_params, "lr": cfg["lr_backbone"]},
-                             {"params": [p for p in model.parameters() if id(p) not in enc_ids], "lr": cfg["lr_head"]}],
+                             {"params": [p for p in model.parameters() if id(p) not in enc_ids and p.requires_grad and not any(p is q for q in model.enc.parameters())], "lr": cfg["lr_head"]}],
                             weight_decay=cfg["weight_decay"])
     steps = cfg["epochs"] * len(dl_tr) // cfg["accum"]
     warm = max(1, int(steps * cfg["warmup_frac"]))
