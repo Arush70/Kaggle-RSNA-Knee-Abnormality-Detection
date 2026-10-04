@@ -27,6 +27,9 @@ ap.add_argument("--drop", type=float, default=0.3)
 ap.add_argument("--gold_weight", type=float, default=3.0)
 ap.add_argument("--seeds", type=int, default=3)
 ap.add_argument("--only_fold", type=int, default=-1)
+ap.add_argument("--blocks", default="all", help="which 384-d feature blocks to use: 'all' or e.g. '0,1,2' "
+                                                "(0=CLS, 1=mean patch, 2=centre focal, 3..11=3x3 grid)")
+ap.add_argument("--quiet", type=int, default=0)
 a = ap.parse_args()
 os.makedirs(a.out_dir, exist_ok=True)
 dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,7 +44,11 @@ def auc(y, s):
 # ---------------- data ----------------
 z = np.load(a.features, allow_pickle=False)
 ids = z["ids"].astype(str); X = z["features"]; MK = z["mask"].astype(np.float32)
-print(f"features {X.shape} | slots {z['slots'].tolist()}")
+if a.blocks != "all":
+    sel = [int(b) for b in a.blocks.split(",")]
+    X = np.concatenate([X[:, :, b * 384:(b + 1) * 384] for b in sel], 2)
+if not a.quiet:
+    print(f"features {X.shape} | slots {z['slots'].tolist()}")
 
 train = pd.read_csv(a.train_csv, dtype={"StudyInstanceUID": str}).set_index("StudyInstanceUID")
 pub = pd.read_csv(a.labels, dtype={"StudyInstanceUID": str}).set_index("StudyInstanceUID")
@@ -59,7 +66,7 @@ for i, u in enumerate(ids):
     if u in folds.index:
         F[i] = int(folds.loc[u, "fold"])
 keep = ~np.isnan(Y).any(1) & (F >= 0)
-print(f"usable studies {keep.sum()}/{len(ids)} | gold {int(G[keep].sum())} | folds {np.bincount(F[keep])}")
+if not a.quiet: print(f"usable studies {keep.sum()}/{len(ids)} | gold {int(G[keep].sum())} | folds {np.bincount(F[keep])}")
 
 # report-grade proxy, the same yardstick the earlier runs were judged on
 proxy = None
@@ -144,7 +151,7 @@ for fold in sorted(set(F[keep].tolist())):
     log["folds"][fold] = {"n_val": int(va.sum()), "gold_in_val": int(gv.sum()),
                           "auc_vs_public_labels": round(a_pub, 4), "auc_vs_report_proxy": round(a_proxy, 4),
                           "auc_gold": round(a_gold, 4)}
-    print(f"fold {fold}: public-label AUC {a_pub:.4f} | report-proxy AUC {a_proxy:.4f} | gold {a_gold:.4f} "
+    if not a.quiet: print(f"fold {fold}: public-label AUC {a_pub:.4f} | report-proxy AUC {a_proxy:.4f} | gold {a_gold:.4f} "
           f"({int(gv.sum())} studies) | {(time.time()-t0)/60:.1f} min")
 
 done = oof.sum(1) != 0

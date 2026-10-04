@@ -64,6 +64,18 @@ radiologist-labelled studies in that fold (n=12, so noisy).
 Public reference points: best single public model 0.924, public blend notebook 0.943,
 leaderboard top is 0.958. Top-8 needs roughly 0.955.
 
+### Pooled 5-fold out-of-fold comparison (same 4,406 studies)
+| Model | vs public LLM labels | vs the 57 gold studies |
+|---|---|---|
+| Our DINOv2-small, 5 folds | 0.772 | 0.784 |
+| Frozen public DINOv3 + our head | 0.809 | 0.804 |
+| The two rank-blended, 60% head | **0.829** | **0.830** |
+
+Fine-tuning the public DINOv3 end to end (`finetune_dv3.py`, 8 epochs) helps on gold
+(fold 1: 0.800 -> 0.844; fold 0: 0.701 -> 0.741) but is flat to worse against the LLM labels,
+and it overfits: both folds peak at epoch 2-3 and decline for the rest of the run.
+The script keeps the best epoch, so a shorter schedule is the obvious next adjustment.
+
 ## Things worth remembering
 - Public LLM labels (`pilkwang/rsna-knee-llm-labels`) beat our own report grader
   (0.870 vs 0.806 gold AUC), and mixing them in helped every metric. Labels were the
@@ -72,4 +84,6 @@ leaderboard top is 0.958. Top-8 needs roughly 0.955.
   by scanner or validation scores are inflated.
 - A stalled training run has always been memory pressure: close other Python processes and
   keep `--workers 2`.
+- On Windows a DataLoader with `num_workers>0` re-imports the script in each worker and dies
+  with a `freeze_support` error; `finetune_dv3.py` therefore loads in the main process.
 - Closing the PowerShell window kills training. `run_folds.ps1` writes logs so progress survives.
